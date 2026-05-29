@@ -18,15 +18,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import re
 from typing import Any, Generic, Iterable, Sequence, TypeVar
+
+import structlog
 
 from .budget import Budget
 from .context import RunContext, RunResult
 from .errors import BudgetExceeded, ToolError
 from .messages import Message, ToolCall
 from .models import Model, OpenAIModel
+from .output import OutputSpec
 from .skills import Skill
 from .tools import Tool, as_tool, stringify_result
 from .tracing import Trace, Tracer
@@ -39,11 +41,14 @@ DEFAULT_MAX_TURNS = 12
 class _RunState:
     """Mutable per-run state (kept off ``Agent`` so agents are reusable/concurrent)."""
 
-    __slots__ = ("loaded_skills", "load_skill_tool")
+    __slots__ = ("loaded_skills", "load_skill_tool", "final_result_tool", "final_output", "has_output")
 
     def __init__(self) -> None:
         self.loaded_skills: set[str] = set()
         self.load_skill_tool: Tool | None = None
+        self.final_result_tool: Tool | None = None
+        self.final_output: Any = None
+        self.has_output: bool = False  # set once final_result validates (output may be falsy)
 
 
 class Agent(Generic[DepsT]):
@@ -57,6 +62,8 @@ class Agent(Generic[DepsT]):
         tools: callables or :class:`~agentic.tools.Tool` objects the model may call.
         skills: :class:`~agentic.skills.Skill` bundles (auto-loaded or on-demand).
         subagents: other agents this one may delegate to.
+        output_type: if set (a pydantic model, dataclass, TypedDict, or any type),
+            ``RunResult.output`` is a validated instance of it instead of text.
         max_turns: maximum model round-trips before the run stops with
             ``stop_reason="max_turns"``.
     """
@@ -70,12 +77,17 @@ class Agent(Generic[DepsT]):
         tools: Iterable[Tool | Any] = (),
         skills: Iterable[Skill] = (),
         subagents: Iterable["Agent"] = (),
+        output_type: Any = None,
         max_turns: int = DEFAULT_MAX_TURNS,
     ) -> None:
         self.model: Model = OpenAIModel(model) if isinstance(model, str) else model
         self.name = name
         self.instructions = instructions
         self.max_turns = max_turns
+        # Structured output is off when output_type is None or plain `str`.
+        self._output: OutputSpec | None = (
+            OutputSpec(output_type) if output_type not in (None, str) else None
+        )
 
         self._base_tools: list[Tool] = [as_tool(t) for t in tools]
         skills = list(skills)
@@ -102,9 +114,9 @@ class Agent(Generic[DepsT]):
         budget: Budget | None = None,
         message_history: Sequence[Message] | None = None,
         max_turns: int | None = None,
-        logger: logging.Logger | None = None,
+        logger: Any = None,
         _parent_ctx: RunContext | None = None,
-    ) -> RunResult[DepsT]:
+    ) -> RunResult[Any]:
         """Run the agent on ``user_input`` and return a :class:`RunResult`.
 
         Raises :class:`~agentic.errors.BudgetExceeded` if a token/time/turn
@@ -122,7 +134,7 @@ class Agent(Generic[DepsT]):
         else:
             budget = (budget or Budget()).start()
             trace = Trace()
-            tracer = Tracer(trace, logger=logger or logging.getLogger("agentic.trace"))
+            tracer = Tracer(trace, logger=logger)
 
         ctx: RunContext = RunContext(
             deps=deps, budget=budget, tracer=tracer, trace=trace, agent_name=self.name
@@ -132,6 +144,8 @@ class Agent(Generic[DepsT]):
         state = _RunState()
         if self._loadable_skills:
             state.load_skill_tool = self._make_load_skill_tool(state)
+        if self._output is not None:
+            state.final_result_tool = self._make_final_result_tool(state)
 
         convo: list[Message] = [Message.system(self._compose_system_prompt())]
         if message_history:
@@ -144,56 +158,101 @@ class Agent(Generic[DepsT]):
         turns_done = 0
 
         span_kind = "subagent" if is_subagent else "run"
-        async with tracer.span(span_kind, self.name, model=self.model.name) as run_span:
-            for turn in range(1, max_turns + 1):
-                budget.tick_turn()
-                budget.check()
-                turns_done = turn
+        # Tag every log line emitted during this (sub)agent's turn with its name.
+        bind_tokens = structlog.contextvars.bind_contextvars(agent=self.name)
+        try:
+            async with tracer.span(span_kind, self.name, model=self.model.name) as run_span:
+                try:
+                    for turn in range(1, max_turns + 1):
+                        budget.tick_turn()
+                        budget.check()
+                        turns_done = turn
 
-                async with tracer.span("turn", str(turn)) as turn_span:
-                    remaining = budget.time_left_or_raise()
-                    tools_by_name = self._active_tools(state)
-                    tool_list = list(tools_by_name.values())
+                        async with tracer.span("turn", str(turn)) as turn_span:
+                            remaining = budget.time_left_or_raise()
+                            tools_by_name = self._active_tools(state)
+                            tool_list = list(tools_by_name.values())
 
-                    async with tracer.span(
-                        "model", self.model.name, model=self.model.name, tools=len(tool_list)
-                    ) as model_span:
-                        resp = await _with_deadline(
-                            self.model.generate(convo, tool_list, timeout=remaining), budget
-                        )
-                        budget.add_usage(
-                            resp.prompt_tokens, resp.completion_tokens, resp.total_tokens
-                        )
-                        model_span.attributes.update(
-                            prompt_tokens=resp.prompt_tokens,
-                            completion_tokens=resp.completion_tokens,
-                            total_tokens=resp.total_tokens,
-                            finish_reason=resp.finish_reason,
-                        )
+                            async with tracer.span(
+                                "model",
+                                self.model.name,
+                                model=self.model.name,
+                                tools=len(tool_list),
+                            ) as model_span:
+                                resp = await _with_deadline(
+                                    self.model.generate(convo, tool_list, timeout=remaining),
+                                    budget,
+                                )
+                                budget.add_usage(
+                                    resp.prompt_tokens, resp.completion_tokens, resp.total_tokens
+                                )
+                                model_span.attributes.update(
+                                    prompt_tokens=resp.prompt_tokens,
+                                    completion_tokens=resp.completion_tokens,
+                                    total_tokens=resp.total_tokens,
+                                    finish_reason=resp.finish_reason,
+                                    # usage statistics + remaining budget for the log line
+                                    cum_tokens=budget.usage.total_tokens,
+                                    tokens_left=budget.remaining_tokens,
+                                    time_left=(
+                                        round(budget.remaining_time, 2)
+                                        if budget.remaining_time is not None
+                                        else None
+                                    ),
+                                )
 
-                    budget.check()  # stop promptly if that call pushed us over
+                            budget.check()  # stop promptly if that call pushed us over
 
-                    assistant = resp.message
-                    convo.append(assistant)
-                    if assistant.content:
-                        last_text = assistant.content
+                            assistant = resp.message
+                            convo.append(assistant)
+                            if assistant.content:
+                                last_text = assistant.content
 
-                    if not assistant.tool_calls:
-                        output = assistant.content or ""
-                        turn_span.attributes["result"] = "final answer"
-                        break
+                            if not assistant.tool_calls:
+                                if self._output is not None and not state.has_output:
+                                    # Wanted structured output but got prose: nudge & retry.
+                                    convo.append(
+                                        Message.user(
+                                            "Please provide the final answer by calling the "
+                                            f"`{self._output.tool_name}` tool."
+                                        )
+                                    )
+                                    tracer.event("awaiting structured result")
+                                    continue
+                                output = assistant.content or ""
+                                turn_span.attributes["result"] = "final answer"
+                                tracer.event("final answer", chars=len(output))
+                                break
 
-                    turn_span.attributes["tool_calls"] = [tc.name for tc in assistant.tool_calls]
-                    results = await self._run_tools(
-                        assistant.tool_calls, tools_by_name, ctx, state
-                    )
-                    convo.extend(results)
-            else:
-                stop_reason = "max_turns"
-                output = last_text
+                            # Surface what the agent decided to do this turn.
+                            tool_names = [tc.name for tc in assistant.tool_calls]
+                            turn_span.attributes["tool_calls"] = tool_names
+                            tracer.event("calling tools", tools=tool_names)
+                            results = await self._run_tools(
+                                assistant.tool_calls, tools_by_name, ctx, state
+                            )
+                            convo.extend(results)
 
-            run_span.attributes["stop_reason"] = stop_reason
-            run_span.attributes["total_tokens"] = budget.usage.total_tokens
+                            # A validated structured result ends the run.
+                            if state.has_output:
+                                output = state.final_output
+                                turn_span.attributes["result"] = "structured result"
+                                tracer.event("final result", type=type(output).__name__)
+                                break
+                    else:
+                        stop_reason = "max_turns"
+                        output = last_text
+                except BudgetExceeded as exc:
+                    # Attach the partial conversation for debugging / partial use.
+                    exc.messages = convo[1:]
+                    run_span.attributes["stop_reason"] = f"budget:{exc.kind}"
+                    run_span.attributes["total_tokens"] = budget.usage.total_tokens
+                    raise
+
+                run_span.attributes["stop_reason"] = stop_reason
+                run_span.attributes["total_tokens"] = budget.usage.total_tokens
+        finally:
+            structlog.contextvars.reset_contextvars(**bind_tokens)
 
         return RunResult(
             output=output,
@@ -205,7 +264,7 @@ class Agent(Generic[DepsT]):
             trace=trace,
         )
 
-    def run_sync(self, user_input: str, **kwargs: Any) -> RunResult[DepsT]:
+    def run_sync(self, user_input: str, **kwargs: Any) -> RunResult[Any]:
         """Convenience blocking wrapper around :meth:`run` for scripts/notebooks."""
         return asyncio.run(self.run(user_input, **kwargs))
 
@@ -270,6 +329,8 @@ class Agent(Generic[DepsT]):
             ordered.extend(self._loadable_skills[name].tools)
         if state.load_skill_tool is not None:
             ordered.append(state.load_skill_tool)
+        if state.final_result_tool is not None:
+            ordered.append(state.final_result_tool)
 
         by_name: dict[str, Tool] = {}
         for tool in ordered:
@@ -309,7 +370,38 @@ class Agent(Generic[DepsT]):
                 f"{lines}"
             )
 
+        if self._output is not None:
+            parts.append(
+                "## Final answer\n"
+                f"When you have the complete answer, call the `{self._output.tool_name}` tool "
+                "with the result as structured data. Do not write the final answer as plain text."
+            )
+
         return "\n\n".join(parts) if parts else "You are a helpful assistant."
+
+    def _make_final_result_tool(self, state: _RunState) -> Tool:
+        spec = self._output
+        assert spec is not None
+
+        async def final_result(ctx: RunContext, **fields: Any) -> str:
+            try:
+                state.final_output = spec.validate(fields)
+            except Exception as exc:  # noqa: BLE001 - recoverable: the model retries
+                raise ToolError(f"the result did not match the required schema: {exc}")
+            state.has_output = True
+            return "Final result accepted."
+
+        return Tool(
+            name=spec.tool_name,
+            description=(
+                "Provide the final answer as structured data matching the required schema. "
+                "Call this exactly once, when you have the complete answer."
+            ),
+            parameters=spec.parameters,
+            func=final_result,
+            takes_context=True,
+            context_param="ctx",
+        )
 
     def _make_load_skill_tool(self, state: _RunState) -> Tool:
         loadable = self._loadable_skills

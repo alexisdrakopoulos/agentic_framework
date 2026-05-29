@@ -10,6 +10,7 @@ from .messages import Message
 from .tracing import Trace, Tracer
 
 DepsT = TypeVar("DepsT")
+OutputT = TypeVar("OutputT")
 
 
 @dataclass
@@ -42,11 +43,12 @@ class RunContext(Generic[DepsT]):
 
 
 @dataclass
-class RunResult(Generic[DepsT]):
+class RunResult(Generic[OutputT]):
     """Everything produced by :meth:`Agent.run`."""
 
-    output: str
-    """The model's final text answer."""
+    output: OutputT
+    """The final answer: the model's text, or a validated instance of the
+    agent's ``output_type`` when one is configured."""
 
     messages: list[Message] = field(default_factory=list)
     """New conversation messages from this run (excluding the system prompt).
@@ -73,4 +75,4 @@ class RunResult(Generic[DepsT]):
         return self.trace.as_dict()
 
     def __str__(self) -> str:
-        return self.output
+        return str(self.output)

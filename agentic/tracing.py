@@ -1,15 +1,19 @@
-"""Tracing: a structured span tree plus optional live logging.
+"""Tracing & logging: a structured span tree plus live structlog output.
 
-Every interesting step of a run (the run itself, each turn, each model call,
-each tool call, each subagent delegation, each skill load) is recorded as a
-:class:`Span`. Spans nest to form a tree that is attached to the
-:class:`~agentic.context.RunResult` and is JSON-serialisable for offline
-inspection. If a ``logging.Logger`` is supplied, spans are also emitted live as
-an indented, human-readable trace.
+Two complementary records of a run:
 
-Nesting is tracked with a :class:`contextvars.ContextVar`, so it stays correct
-even when tool calls run concurrently via ``asyncio.gather`` (each task gets its
-own copy of the context).
+* A :class:`Trace` — an in-memory tree of :class:`Span` objects (run → turn →
+  model/tool/subagent...). It is attached to every
+  :class:`~agentic.context.RunResult`, is JSON-serialisable (``trace.as_dict()``),
+  and renders as an indented tree (``trace.format()``). Always built, even when
+  logging is silent.
+
+* Live **structlog** events — emitted as the run happens when logging is enabled
+  via :func:`configure_logging`. Each line carries structured fields: the acting
+  ``agent``, token usage and remaining budget after every model call, the tool
+  being run with its arguments and result, skill loads, and so on. Nesting is
+  shown by indentation and tracked with ``contextvars`` so it stays correct
+  under concurrent tool calls.
 """
 
 from __future__ import annotations
@@ -22,14 +26,17 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
-# The span currently in scope for the running task.
+import structlog
+
+# The span currently in scope for the running task (copied per asyncio task).
 _current_span: contextvars.ContextVar["Span | None"] = contextvars.ContextVar(
     "agentic_current_span", default=None
 )
 
-DEFAULT_LOGGER_NAME = "agentic.trace"
+# Whether configure_logging() has been called. Until then, live logging is off
+# so importing the framework never spams stdout; the trace tree is still built.
+_LOGGING_CONFIGURED = False
 
-# Symbols used in the live log, keyed by span status.
 _KIND_ICON = {
     "run": "▶",
     "subagent": "⮑",
@@ -59,9 +66,7 @@ class Span:
 
     @property
     def duration(self) -> float | None:
-        if self.end is None:
-            return None
-        return self.end - self.start
+        return None if self.end is None else self.end - self.start
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -87,7 +92,7 @@ class Trace:
         return self.root.as_dict() if self.root else None
 
     def format(self) -> str:
-        """Render the trace as an indented text tree."""
+        """Render the trace as an indented text tree (no logging required)."""
         if self.root is None:
             return "(empty trace)"
         lines: list[str] = []
@@ -95,43 +100,40 @@ class Trace:
         return "\n".join(lines)
 
     def _format_span(self, span: Span, lines: list[str]) -> None:
-        icon = _KIND_ICON.get(span.kind, "·")
-        if span.status == "error":
-            icon = "✖"
+        icon = "✖" if span.status == "error" else _KIND_ICON.get(span.kind, "·")
         dur = f" ({span.duration:.3f}s)" if span.duration is not None else ""
-        attrs = ""
-        if span.attributes:
-            shown = {
-                k: v
-                for k, v in span.attributes.items()
-                if k in ("model", "total_tokens", "tools", "stop_reason", "result")
-            }
-            if shown:
-                attrs = " " + " ".join(f"{k}={v}" for k, v in shown.items())
+        shown_keys = ("model", "total_tokens", "tools", "stop_reason", "result", "arguments")
+        attrs = " ".join(
+            f"{k}={span.attributes[k]}" for k in shown_keys if k in span.attributes
+        )
+        attrs = f" {attrs}" if attrs else ""
         lines.append(f"{'  ' * span.depth}{icon} {span.kind}:{span.name}{dur}{attrs}")
         for event in span.events:
-            lines.append(f"{'  ' * (span.depth + 1)}· {event.get('message', '')}")
+            lines.append(f"{'  ' * (span.depth + 1)}· {event.get('event', '')}")
         for child in span.children:
             self._format_span(child, lines)
 
 
 class Tracer:
-    """Creates spans and (optionally) logs them live.
+    """Builds the span tree and (optionally) streams structlog events.
 
-    Pass ``logger=None`` to capture the trace tree silently; pass a configured
-    logger (see :func:`configure_logging`) to also stream the run as it happens.
+    Args:
+        trace: the :class:`Trace` to populate (a fresh one if omitted).
+        logger: a structlog logger to emit to; defaults to ``get_logger("agentic")``.
+        enabled: force live logging on/off. Defaults to whether
+            :func:`configure_logging` has been called.
     """
 
     def __init__(
         self,
         trace: Trace | None = None,
         *,
-        logger: logging.Logger | None = None,
-        log_level: int = logging.INFO,
+        logger: Any = None,
+        enabled: bool | None = None,
     ) -> None:
         self.trace = trace if trace is not None else Trace()
-        self.logger = logger
-        self.log_level = log_level
+        self.log = logger if logger is not None else structlog.get_logger("agentic")
+        self.enabled = enabled if enabled is not None else (_LOGGING_CONFIGURED or logger is not None)
 
     @asynccontextmanager
     async def span(self, kind: str, name: str, **attributes: Any) -> AsyncIterator[Span]:
@@ -146,13 +148,10 @@ class Tracer:
             attributes=dict(attributes),
         )
         self.trace.spans.append(span)
-        if parent is not None:
-            parent.children.append(span)
-        else:
-            self.trace.root = span
+        (parent.children if parent else _RootSlot(self.trace)).append(span)
 
         token = _current_span.set(span)
-        self._log(span, "start")
+        self._log_start(span)
         try:
             yield span
         except BaseException as exc:  # noqa: BLE001 - record then re-raise
@@ -162,57 +161,143 @@ class Tracer:
         finally:
             span.end = time.monotonic()
             _current_span.reset(token)
-            self._log(span, "end")
+            self._log_end(span)
 
-    def event(self, message: str, **fields: Any) -> None:
-        """Attach a point-in-time event to the current span."""
+    def event(self, event: str, **fields: Any) -> None:
+        """Record a point-in-time event on the current span (and log it)."""
         span = _current_span.get()
-        record = {"message": message, **fields}
+        record = {"event": event, **fields}
+        depth = (span.depth + 1) if span else 0
         if span is not None:
             span.events.append(record)
-        if self.logger is not None:
-            depth = (span.depth + 1) if span else 0
-            self.logger.log(self.log_level, "%s· %s", "  " * depth, message)
+        if self.enabled:
+            self.log.info(event, _depth=depth, **fields)
 
-    def _log(self, span: Span, phase: str) -> None:
-        if self.logger is None or not self.logger.isEnabledFor(self.log_level):
+    # --- live logging -------------------------------------------------------------
+
+    def _log_start(self, span: Span) -> None:
+        if not self.enabled:
             return
-        indent = "  " * span.depth
-        if phase == "start":
-            icon = _KIND_ICON.get(span.kind, "·")
-            extra = ""
-            if span.kind == "model" and "model" in span.attributes:
-                extra = f" [{span.attributes['model']}]"
-            elif span.kind in ("tool", "skill") or span.kind == "subagent":
-                extra = ""
-            self.logger.log(self.log_level, "%s%s %s:%s%s", indent, icon, span.kind, span.name, extra)
-        else:  # end
-            icon = "✖" if span.status == "error" else "✓"
-            dur = f"{span.duration:.3f}s" if span.duration is not None else "?"
-            note = ""
-            if span.kind == "model" and "total_tokens" in span.attributes:
-                note = f" +{span.attributes['total_tokens']} tok"
-            elif span.status == "error" and span.error:
-                note = f" {span.error}"
-            elif span.kind in ("run", "subagent") and "total_tokens" in span.attributes:
-                note = f" {span.attributes['total_tokens']} tok"
-            self.logger.log(
-                self.log_level, "%s%s %s:%s (%s)%s", indent, icon, span.kind, span.name, dur, note
+        if span.kind in ("run", "subagent"):
+            self.log.info(f"{span.kind} started", _depth=span.depth, name=span.name)
+        elif span.kind == "turn":
+            self.log.info("turn", _depth=span.depth, n=span.name)
+        # model/tool spans are logged on completion (when results/usage exist).
+
+    def _log_end(self, span: Span) -> None:
+        if not self.enabled:
+            return
+        dur = round(span.duration, 4) if span.duration is not None else None
+        a = span.attributes
+        if span.kind == "model":
+            self.log.info(
+                "llm response" if span.status == "ok" else "llm error",
+                _depth=span.depth,
+                model=a.get("model"),
+                tokens_in=a.get("prompt_tokens"),
+                tokens_out=a.get("completion_tokens"),
+                tokens=a.get("total_tokens"),
+                cum_tokens=a.get("cum_tokens"),
+                tokens_left=a.get("tokens_left"),
+                time_left=a.get("time_left"),
+                dur=dur,
+            )
+        elif span.kind == "tool":
+            self.log.info(
+                "tool ok" if span.status == "ok" else "tool error",
+                _depth=span.depth,
+                tool=span.name,
+                args=a.get("arguments"),
+                result=a.get("result"),
+                error=span.error,
+                dur=dur,
+            )
+        elif span.kind in ("run", "subagent"):
+            self.log.info(
+                f"{span.kind} finished",
+                _depth=span.depth,
+                name=span.name,
+                stop=a.get("stop_reason"),
+                tokens=a.get("total_tokens"),
+                dur=dur,
             )
 
 
-def configure_logging(level: int = logging.INFO) -> logging.Logger:
-    """Attach a clean console handler to the ``agentic`` logger and return it.
+class _RootSlot:
+    """Tiny adapter so ``span()`` can ``.append`` to either a parent or the root."""
 
-    Call this once from an application/script to see live traces. It is a no-op
-    to call more than once (it will not stack duplicate handlers).
+    __slots__ = ("_trace",)
+
+    def __init__(self, trace: Trace) -> None:
+        self._trace = trace
+
+    def append(self, span: Span) -> None:
+        self._trace.root = span
+
+
+# --- structlog configuration ------------------------------------------------------
+
+
+def _make_depth_processor(json: bool) -> Any:
+    """A structlog processor that handles the ``_depth`` field and drops None values.
+
+    Console mode indents the event message by depth (human-readable nesting);
+    JSON mode keeps ``depth`` as a numeric field (machine-readable nesting).
     """
-    logger = logging.getLogger("agentic")
-    logger.setLevel(level)
-    if not any(getattr(h, "_agentic", False) for h in logger.handlers):
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        handler._agentic = True  # type: ignore[attr-defined]
-        logger.addHandler(handler)
-    logger.propagate = False
-    return logging.getLogger(DEFAULT_LOGGER_NAME)
+
+    def processor(_logger: Any, _method: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+        depth = int(event_dict.pop("_depth", 0) or 0)
+        if json:
+            if depth:
+                event_dict["depth"] = depth
+        elif depth:
+            event_dict["event"] = "  " * depth + str(event_dict.get("event", ""))
+        return {k: v for k, v in event_dict.items() if v is not None}
+
+    return processor
+
+
+def configure_logging(
+    level: str | int = "info",
+    *,
+    json: bool = False,
+    extra_processors: list[Any] | None = None,
+) -> Any:
+    """Turn on live structured logging for runs and return the ``agentic`` logger.
+
+    Call once from your application/script. Without it, runs are silent (the
+    trace tree is still captured on each :class:`~agentic.context.RunResult`).
+
+    Args:
+        level: minimum level, e.g. ``"info"`` or ``"debug"`` (or a logging int).
+        json: emit one JSON object per line (production) instead of the colourised
+            console renderer (development).
+        extra_processors: structlog processors inserted into the chain *before*
+            rendering. Each receives every event (with bound context vars like
+            ``agent`` and any you bind yourself) and must return the event dict.
+            This is the hook for taps that mirror agent activity elsewhere — e.g.
+            into a progress store a UI can poll. See ``examples/08_progress_polling.py``.
+    """
+    global _LOGGING_CONFIGURED
+
+    lvl = logging.getLevelName(level.upper()) if isinstance(level, str) else level
+    processors: list[Any] = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        *(extra_processors or []),
+        _make_depth_processor(json),
+        structlog.processors.TimeStamper(fmt="%H:%M:%S"),
+    ]
+    if json:
+        processors += [structlog.processors.format_exc_info, structlog.processors.JSONRenderer()]
+    else:
+        processors.append(structlog.dev.ConsoleRenderer(colors=True))
+
+    structlog.configure(
+        processors=processors,
+        wrapper_class=structlog.make_filtering_bound_logger(lvl),
+        logger_factory=structlog.PrintLoggerFactory(),
+        cache_logger_on_first_use=False,
+    )
+    _LOGGING_CONFIGURED = True
+    return structlog.get_logger("agentic")

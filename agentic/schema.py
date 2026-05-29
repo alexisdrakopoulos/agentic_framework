@@ -36,6 +36,33 @@ _PRIMITIVES: dict[type, dict[str, str]] = {
 _SEQUENCE_ORIGINS = (list, set, frozenset, tuple, typing.Sequence)
 
 
+def safe_type_hints(func: Any, *, include_extras: bool = True) -> dict[str, Any]:
+    """``typing.get_type_hints`` that degrades gracefully.
+
+    If the whole-function resolution fails (e.g. an annotation references a type
+    that is local to the defining function and therefore invisible to
+    ``get_type_hints``), fall back to resolving each annotation individually so
+    that one bad annotation does not discard the rest.
+    """
+    try:
+        return get_type_hints(func, include_extras=include_extras)
+    except Exception:  # noqa: BLE001
+        pass
+
+    hints: dict[str, Any] = {}
+    raw = getattr(func, "__annotations__", {}) or {}
+    func_globals = getattr(func, "__globals__", {})
+    for key, value in raw.items():
+        if not isinstance(value, str):
+            hints[key] = value
+            continue
+        try:
+            hints[key] = eval(value, func_globals)  # noqa: S307 - resolve own annotations
+        except Exception:  # noqa: BLE001 - leave this one unresolved
+            continue
+    return hints
+
+
 def _is_union(origin: Any) -> bool:
     return origin is Union or origin is getattr(types, "UnionType", ())
 
@@ -112,10 +139,7 @@ def build_parameters_schema(func: Any, *, skip: set[str] | None = None) -> dict[
     """Build the ``parameters`` object schema for ``func``."""
     skip = skip or set()
     sig = inspect.signature(func)
-    try:
-        hints = get_type_hints(func, include_extras=True)
-    except Exception:  # noqa: BLE001 - annotations that cannot be resolved
-        hints = {}
+    hints = safe_type_hints(func, include_extras=True)
     doc_params = parse_docstring_params(inspect.getdoc(func) or "")
 
     properties: dict[str, Any] = {}
@@ -145,10 +169,7 @@ def build_parameters_schema(func: Any, *, skip: set[str] | None = None) -> dict[
 def find_context_param(func: Any, ctx_type: type) -> str | None:
     """Return the name of the parameter annotated as ``ctx_type`` (or its
     generic alias), if any. Used to inject the run context into tools."""
-    try:
-        hints = get_type_hints(func, include_extras=False)
-    except Exception:  # noqa: BLE001
-        hints = {}
+    hints = safe_type_hints(func, include_extras=False)
     sig = inspect.signature(func)
     for name in sig.parameters:
         annotation = hints.get(name)

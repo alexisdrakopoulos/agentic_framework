@@ -16,10 +16,15 @@ import enum
 import inspect
 import json
 from dataclasses import dataclass
-from typing import Any, Callable, get_args, get_origin, get_type_hints
+from typing import Any, Callable, get_args, get_origin
 
 from .context import RunContext
-from .schema import build_parameters_schema, find_context_param, summarize_docstring
+from .schema import (
+    build_parameters_schema,
+    find_context_param,
+    safe_type_hints,
+    summarize_docstring,
+)
 
 
 @dataclass
@@ -61,10 +66,7 @@ class Tool:
         return self.func(**kwargs)
 
     def _coerce_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        try:
-            hints = get_type_hints(self.func)
-        except Exception:  # noqa: BLE001
-            hints = {}
+        hints = safe_type_hints(self.func, include_extras=False)
         out: dict[str, Any] = {}
         for key, value in arguments.items():
             annotation = hints.get(key)
